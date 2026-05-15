@@ -1,0 +1,13 @@
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.0.0
+pydantic-settings==2.13.1
+python-multipart>=0.0.6
+httpx>=0.24.0
+langgraph==1.1.6
+langchain==1.2.15
+langchain-openrouter==0.2.0
+langgraph-checkpoint-postgres==3.0.5
+psycopg-binary==3.3.3
+psycopg-pool==3.3.0
+RapidFuzz==3.14.5

@@ -1,0 +1,122 @@
+version: "3.8"
+
+services:
+
+  db-service:
+    build: ./apps/db-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+    ports:
+      - ${DB_SERVICE_PORT}:${DB_SERVICE_PORT}
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - ${REDIS_PORT:-6379}:6379
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ./redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:15
+    env_file:
+      - .env
+    volumes:
+      - ./db:/docker-entrypoint-initdb.d
+      - ./pg_data:/var/lib/postgresql/data
+    ports:
+      - ${DB_PORT}:${DB_PORT}
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  postgres-checkpointer:
+    image: postgres:15
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_USER=${LANGGRAPH_RECEIPT_DB_USER}
+      - POSTGRES_PASSWORD=${LANGGRAPH_RECEIPT_DB_PASSWORD}
+      - POSTGRES_DB=${LANGGRAPH_RECEIPT_DB_NAME}
+    volumes:
+      - ./checkpointer_receipt_data:/var/lib/postgresql/data
+    ports:
+      - ${LANGGRAPH_RECEIPT_DB_PORT_EXTERNAL}:${LANGGRAPH_RECEIPT_DB_PORT_INTERNAL}
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${LANGGRAPH_RECEIPT_DB_USER} -d ${LANGGRAPH_RECEIPT_DB_NAME}" ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  postgres-room-checkpointer:
+    image: postgres:15
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_USER=${LANGGRAPH_ROOM_DB_USER}
+      - POSTGRES_PASSWORD=${LANGGRAPH_ROOM_DB_PASSWORD}
+      - POSTGRES_DB=${LANGGRAPH_ROOM_DB_NAME}
+    volumes:
+      - ./checkpointer_room_data:/var/lib/postgresql/data
+    ports:
+      - ${LANGGRAPH_ROOM_DB_PORT_EXTERNAL}:${LANGGRAPH_ROOM_DB_PORT_INTERNAL}
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${LANGGRAPH_ROOM_DB_USER} -d ${LANGGRAPH_ROOM_DB_NAME}" ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+
+  executor-service:
+    build: ./apps/executor-service
+    env_file:
+      - .env
+    ports:
+      - ${EXEC_SERVICE_PORT}:${EXEC_SERVICE_PORT}
+    volumes:
+      - ./apps/executor-service/app:/app/app
+    depends_on:
+      postgres-checkpointer:
+        condition: service_healthy
+      postgres-room-checkpointer:
+        condition: service_healthy
+      asr-service:
+        condition: service_started
+    healthcheck:
+      test: [ "CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:${EXEC_SERVICE_PORT}/health', timeout=5)\"" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  asr-service:
+    build: ./apps/asr-service
+    env_file:
+      - .env
+    ports:
+      - ${ASR_SERVICE_PORT:-5030}:5030
+    environment:
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - ASR_MODEL=${ASR_MODEL:-mistralai/voxtral-small-24b-2507}
+    healthcheck:
+      test: [ "CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5030/health', timeout=5)\"" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s

@@ -1,0 +1,66 @@
+# macOS / editors
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+pip-wheel-metadata/
+
+# Node / frontend
+node_modules/
+dist/
+build/
+coverage/
+.vite/
+.turbo/
+.cache/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Logs and runtime files
+*.log
+logs/
+*.pid
+*.seed
+
+# Docker / database volumes
+pg_data/
+**/pg_data/
+checkpointer_*_data/
+**/checkpointer_*_data/
+redis_data/
+
+# Local OCR/debug outputs
+debug/
+debug_*/
+result*.json
