@@ -67,7 +67,8 @@ src/
 The app communicates with the backend API. Configure the API URL in `.env`:
 
 ```
-VITE_API_URL=http://localhost:8000/api
+VITE_API_URL=http://localhost:18000
+VITE_WS_URL=ws://localhost:18000
 ```
 
 ## User Flow
