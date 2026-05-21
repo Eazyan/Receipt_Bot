@@ -1,5 +1,8 @@
 import base64
-from openrouter import OpenRouter
+from typing import Any
+
+import httpx
+
 from app.core.config import get_settings
 from app.core.logger import get_logger
 from app.api.schemas import TranscriptionResponse
@@ -27,9 +30,9 @@ class ASRService:
             raise ASRConfigError("OPENROUTER_API_KEY not configured")
 
         self.api_key = settings.openrouter_api_key
-        self.model = settings.asr_model
+        self.models = self._model_candidates()
 
-        logger.info(f"ASR Service initialized with model: {self.model}")
+        logger.info(f"ASR Service initialized with models: {', '.join(self.models)}")
 
     async def transcribe(
         self,
@@ -42,40 +45,12 @@ class ASRService:
 
             logger.info(f"Transcribing audio ({len(audio_bytes)} bytes, format: {audio_format})")
 
-            with OpenRouter(api_key=self.api_key) as client:
-                response = client.chat.send(
-                    model=self.model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "You are an automatic speech recognition system. "
-                                       "Transcribe audio exactly as spoken. "
-                                       "Do not translate. Do not explain.",
-                        },
-                        {
-                            "role": "user",
-                            "content": user_prompt,
-                        },
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "input_audio",
-                                    "input_audio": {
-                                        "data": audio_base64,
-                                        "format": audio_format,
-                                    },
-                                }
-                            ],
-                        },
-                    ],
-                    temperature=0,
-                )
+            response_data, used_model = await self._transcribe_with_fallbacks(
+                audio_base64=audio_base64,
+                audio_format=audio_format,
+            )
 
-            if not response.choices or not response.choices[0].message:
-                raise ASRProcessingError("Empty response from ASR model")
-
-            transcribed_text = response.choices[0].message.content.strip()
+            transcribed_text = str(response_data.get("text") or "").strip()
 
             if not transcribed_text:
                 raise ASRProcessingError("Model returned empty text")
@@ -87,7 +62,7 @@ class ASRService:
             return TranscriptionResponse(
                 text=transcribed_text,
                 language=language,
-                model=self.model,
+                model=used_model,
                 confidence=1.0,
             )
 
@@ -95,6 +70,93 @@ class ASRService:
             error_msg = f"ASR transcription failed: {str(e)}"
             logger.error(error_msg, exc_info=True)
             raise ASRProcessingError(error_msg) from e
+
+    def _model_candidates(self) -> list[str]:
+        models = [settings.asr_model, *settings.asr_fallback_models.split(",")]
+        result: list[str] = []
+        for model in models:
+            clean_model = model.strip()
+            if clean_model and clean_model not in result:
+                result.append(clean_model)
+        return result
+
+    async def _transcribe_with_fallbacks(
+        self,
+        audio_base64: str,
+        audio_format: str,
+    ) -> tuple[dict[str, Any], str]:
+        errors: list[str] = []
+        for model in self.models:
+            try:
+                response_data = await self._transcribe_via_stt_endpoint(
+                    model=model,
+                    audio_base64=audio_base64,
+                    audio_format=audio_format,
+                )
+                return response_data, model
+            except ASRProcessingError as exc:
+                errors.append(f"{model}: {exc}")
+                logger.warning(f"ASR model failed, trying fallback if available: {model}: {exc}")
+
+        raise ASRProcessingError("; ".join(errors) or "All ASR models failed")
+
+    async def _transcribe_via_stt_endpoint(
+        self,
+        model: str,
+        audio_base64: str,
+        audio_format: str,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": model,
+            "input_audio": {
+                "data": audio_base64,
+                "format": audio_format,
+            },
+            "temperature": settings.asr_temperature,
+        }
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        async with httpx.AsyncClient(timeout=settings.asr_timeout) as client:
+            response = await client.post(
+                f"{settings.openrouter_base_url.rstrip('/')}/audio/transcriptions",
+                json=payload,
+                headers=headers,
+            )
+
+        if response.status_code >= 400:
+            detail = self._extract_error_detail(response)
+            raise ASRProcessingError(f"HTTP {response.status_code}: {detail}")
+
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise ASRProcessingError("OpenRouter returned non-JSON response") from exc
+
+        if not str(data.get("text") or "").strip():
+            raise ASRProcessingError("OpenRouter returned empty transcription")
+
+        return data
+
+    def _extract_error_detail(self, response: httpx.Response) -> str:
+        try:
+            data = response.json()
+        except ValueError:
+            return response.text[:400]
+
+        if isinstance(data, dict):
+            error = data.get("error")
+            if isinstance(error, dict):
+                return str(error.get("message") or error.get("detail") or error)[:400]
+            if isinstance(error, str):
+                return error[:400]
+            detail = data.get("detail")
+            if detail:
+                return str(detail)[:400]
+        return str(data)[:400]
 
     def _detect_language(self, text: str) -> str:
         cyrillic_count = sum(1 for c in text if "\u0400" <= c <= "\u04FF")

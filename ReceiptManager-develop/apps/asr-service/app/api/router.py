@@ -22,7 +22,7 @@ async def health_check() -> HealthResponse:
     return HealthResponse(
         status="healthy",
         version=settings.app_version,
-        model=settings.asr_model,
+        model=", ".join([settings.asr_model, *settings.asr_fallback_models.split(",")]),
     )
 
 

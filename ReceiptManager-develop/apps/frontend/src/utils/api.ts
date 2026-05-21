@@ -4,6 +4,7 @@ import type { Room, Receipt, PaymentSplit, RoomLiveState, ItemIntelligence, Item
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 export const WS_BASE_URL = import.meta.env.VITE_WS_URL || API_BASE_URL.replace(/^http/, 'ws');
+export const ASR_URL = import.meta.env.VITE_ASR_URL || (import.meta.env.DEV ? 'http://localhost:15030/transcribe' : '/asr/transcribe');
 
 const toReceipt = (data: any): Receipt => ({
   id: String(data.id),
@@ -132,6 +133,19 @@ export const roomAPI = {
     return data;
   },
 
+  runAssistantCommand: async (
+    roomId: string,
+    participantId: string,
+    command: string,
+  ): Promise<{ message: string; actions: Record<string, unknown>[]; state: RoomLiveState }> => {
+    const { data } = await api.post(`/rooms/${roomId}/assistant`, {
+      participantId,
+      command,
+      updatedAt: new Date().toISOString(),
+    });
+    return data;
+  },
+
   upsertSplitParticipant: async (roomId: string, participantId: string, name: string, color: string): Promise<RoomLiveState> =>
     roomAPI.applyStateAction(roomId, { type: 'upsert_participant', participantId, name, color }),
 
@@ -172,6 +186,34 @@ export const roomAPI = {
     items: Array<{ name: string; quantity: number; category?: ItemCategory }>,
   ): Promise<void> => {
     await api.post(`/rooms/${roomId}/history`, { participantId, items });
+  },
+};
+
+export const asrAPI = {
+  transcribe: async (audio: Blob, filename = 'voice.webm'): Promise<string> => {
+    const formData = new FormData();
+    formData.append('file', audio, filename);
+
+    const response = await fetch(ASR_URL, {
+      method: 'POST',
+      body: formData,
+    });
+
+    if (!response.ok) {
+      let detail = `ASR request failed: HTTP ${response.status}`;
+      try {
+        const errorBody = await response.json();
+        if (typeof errorBody?.detail === 'string') detail = errorBody.detail;
+      } catch {
+        // Keep HTTP status fallback when ASR returns a non-JSON error.
+      }
+      throw new Error(detail);
+    }
+
+    const result = await response.json();
+    const text = String(result?.text ?? result?.transcription ?? result?.result ?? '').trim();
+    if (!text) throw new Error('ASR returned empty transcription');
+    return text;
   },
 };
 

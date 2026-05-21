@@ -12,8 +12,7 @@ import {
 } from '@/components/UI';
 import { useAppStore } from '@/hooks/useAppStore';
 import { hapticFeedback } from '@/utils/telegram';
-
-const ASR_URL = import.meta.env.VITE_ASR_URL || 'http://localhost:5030/transcribe';
+import { asrAPI } from '@/utils/api';
 
 type RecordingState = 'idle' | 'recording' | 'uploading';
 
@@ -37,13 +36,18 @@ export const RoomPage: React.FC = () => {
       setTranscription(null);
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      const preferredMimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
         ? 'audio/webm;codecs=opus'
         : MediaRecorder.isTypeSupported('audio/webm')
         ? 'audio/webm'
-        : 'audio/ogg';
+        : MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')
+        ? 'audio/ogg;codecs=opus'
+        : '';
 
-      const recorder = new MediaRecorder(stream, { mimeType });
+      const recorder = preferredMimeType
+        ? new MediaRecorder(stream, { mimeType: preferredMimeType })
+        : new MediaRecorder(stream);
+      const mimeType = recorder.mimeType || preferredMimeType || 'audio/webm';
       chunksRef.current = [];
 
       recorder.ondataavailable = (e) => {
@@ -98,23 +102,11 @@ export const RoomPage: React.FC = () => {
   const sendToASR = async (blob: Blob, mimeType: string) => {
     try {
       const ext = mimeType.includes('ogg') ? 'ogg' : 'webm';
-      const formData = new FormData();
-      formData.append('file', blob, `recording.${ext}`);
 
       console.log('[ASR] Отправка аудио на сервер...', { size: blob.size, type: mimeType });
 
-      const response = await fetch(ASR_URL, {
-        method: 'POST',
-        body: formData,
-      });
-
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-      const result = await response.json();
-      console.log('[ASR] Результат:', result);
-
-      const text: string =
-        result?.text ?? result?.transcription ?? result?.result ?? JSON.stringify(result);
+      const text = await asrAPI.transcribe(blob, `recording.${ext}`);
+      console.log('[ASR] Результат:', text);
       setTranscription(text);
       setTextInput((prev) => (prev ? prev + ' ' + text : text));
       hapticFeedback('success');

@@ -9,6 +9,7 @@ from app.db.models import ItemAssignment, Receipt, ReceiptItem, Room, RoomPartic
 from app.api.schemas import ParticipantOut, RoomCreate, RoomOut, RoomUpdate
 from app.api.routers.receipts import _receipt_payload
 from app.services.item_intelligence import get_item_intelligence, remember_participant_items
+from app.services.room_assistant import RoomAssistantError, build_room_assistant_plan
 from app.services.room_state import apply_room_action, channel_key, get_redis, get_room_state, public_state_for_participant
 
 router = APIRouter(prefix="/rooms", tags=["rooms"])
@@ -33,6 +34,45 @@ async def apply_live_room_action(room_id: int, payload: dict, db: Session = Depe
     if state is None:
         raise HTTPException(status_code=404, detail="Room not found")
     return state
+
+
+@router.post("/{room_id}/assistant")
+async def run_room_assistant(room_id: int, payload: dict, db: Session = Depends(get_db)):
+    participant_id = str(payload.get("participantId") or payload.get("actorParticipantId") or "").strip()
+    command = str(payload.get("command") or "").strip()
+    if not participant_id:
+        raise HTTPException(status_code=400, detail="participantId is required")
+    if not command:
+        raise HTTPException(status_code=400, detail="Command is required")
+
+    state = await get_room_state(db, room_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    try:
+        plan = build_room_assistant_plan(state, participant_id, command)
+    except RoomAssistantError as exc:
+        detail = str(exc)
+        if "Participant is not in this room" in detail:
+            raise HTTPException(status_code=403, detail=detail) from exc
+        raise HTTPException(status_code=502, detail=detail) from exc
+
+    next_state = public_state_for_participant(state, participant_id)
+    for action in plan["actions"]:
+        action = {
+            **action,
+            "actorParticipantId": participant_id,
+            "updatedAt": payload.get("updatedAt"),
+        }
+        applied = await apply_room_action(db, room_id, action, participant_id)
+        if applied is not None:
+            next_state = applied
+
+    return {
+        "message": plan["message"],
+        "actions": plan["actions"],
+        "state": next_state,
+    }
 
 
 @router.get("/{room_id}/intelligence")

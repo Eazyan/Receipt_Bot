@@ -2,9 +2,8 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { PageContainer, PageContent, PageFooter, Button, Header, Loading, ErrorAlert, Card, Pill, Input, ReceiptSkeleton } from '@/components/UI';
 import { ReceiptItemList, getReceiptSubtotal } from '@/components/ReceiptItems';
 import { useAppStore } from '@/hooks/useAppStore';
-import { roomAPI, WS_BASE_URL } from '@/utils/api';
+import { asrAPI, roomAPI, WS_BASE_URL } from '@/utils/api';
 import { hapticFeedback, showTelegramAlert } from '@/utils/telegram';
-import { parseSplitCommand } from '@/utils/itemIntelligence';
 import { colors, spacing, typography, borderRadius } from '@/styles/theme';
 import type { ItemCategory, ItemIntelligence, PaymentSplit, ReceiptItem, SplitParticipant, SplitMode, SplitProposal } from '@/types';
 
@@ -102,10 +101,16 @@ export const SelectItemsPage: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState('');
   const [commandText, setCommandText] = useState('');
   const [commandStatus, setCommandStatus] = useState<string | null>(null);
+  const [isCommandLoading, setIsCommandLoading] = useState(false);
   const [isListening, setIsListening] = useState(false);
+  const [isVoiceUploading, setIsVoiceUploading] = useState(false);
   const [itemIntelligence, setItemIntelligence] = useState<Record<string, ItemIntelligence>>({});
   const [isIntelligenceLoading, setIsIntelligenceLoading] = useState(false);
   const reconnectTimerRef = useRef<number | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const voiceChunksRef = useRef<Blob[]>([]);
+  const voiceStreamRef = useRef<MediaStream | null>(null);
+  const voiceTimeoutRef = useRef<number | null>(null);
 
   const receipt = currentRoom?.receipt;
   const currentParticipant = splitParticipants.find((participant) => participant.id === currentParticipantId);
@@ -178,6 +183,17 @@ export const SelectItemsPage: React.FC = () => {
       socket?.close();
     };
   }, [applyLiveRoomState, currentParticipantId, currentRoom?.id]);
+
+  useEffect(() => () => {
+    if (voiceTimeoutRef.current) {
+      window.clearTimeout(voiceTimeoutRef.current);
+      voiceTimeoutRef.current = null;
+    }
+    if (mediaRecorderRef.current?.state === 'recording') {
+      mediaRecorderRef.current.stop();
+    }
+    voiceStreamRef.current?.getTracks().forEach((track) => track.stop());
+  }, []);
 
   useEffect(() => {
     if (!currentRoom?.id || !currentParticipantId || !receipt?.items.length) {
@@ -371,53 +387,125 @@ export const SelectItemsPage: React.FC = () => {
     hapticFeedback('success');
   };
 
-  const runAssistantCommand = (rawCommand = commandText) => {
-    const command = parseSplitCommand(rawCommand, receipt.items, splitParticipants, currentParticipant.id);
+  const runAssistantCommand = async (rawCommand = commandText) => {
+    const command = rawCommand.trim();
     if (!command) {
-      setCommandStatus('Не понял команду. Попробуйте: “кофе мне” или “салат Маше”.');
+      setCommandStatus('Напишите команду для агента.');
       hapticFeedback('impact');
       return;
     }
-    if (command.type === 'split_all') {
-      splitAllEvenly();
-      setCommandStatus('Предложил всем равный split.');
-    } else if (command.type === 'claim_self') {
-      assignAllToActive(command.item);
-      setCommandStatus(`Забрал "${command.item.name}" вам.`);
-    } else if (command.type === 'offer_to') {
-      offerItemToParticipant(command.item, command.participant.id);
-      setCommandStatus(`Предложил ${command.participant.name}: "${command.item.name}".`);
-    } else if (command.type === 'split_item') {
-      splitHalfItem(command.item);
-      setCommandStatus(`Предложил поделить "${command.item.name}".`);
+    setIsCommandLoading(true);
+    setCommandStatus('Думаю...');
+    try {
+      const result = await roomAPI.runAssistantCommand(currentRoom.id, currentParticipant.id, command);
+      applyLiveRoomState(result.state);
+      setSyncStatus('live');
+      setCommandStatus(result.message || 'Готово.');
+      setCommandText('');
+      hapticFeedback(result.actions.length > 0 ? 'success' : 'impact');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Агент не смог выполнить команду';
+      setCommandStatus(message);
+      setError(message);
+      hapticFeedback('impact');
+    } finally {
+      setIsCommandLoading(false);
     }
-    setCommandText('');
   };
 
   const startVoiceCommand = () => {
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) {
+    if (isListening) {
+      if (mediaRecorderRef.current?.state === 'recording') {
+        mediaRecorderRef.current.stop();
+      }
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
       setCommandStatus('Голосовой ввод недоступен в этом WebView. Используйте текстовую команду.');
       hapticFeedback('impact');
       return;
     }
-    const recognition = new SpeechRecognition();
-    recognition.lang = 'ru-RU';
-    recognition.interimResults = false;
-    recognition.maxAlternatives = 1;
-    recognition.onstart = () => setIsListening(true);
-    recognition.onend = () => setIsListening(false);
-    recognition.onerror = () => {
-      setIsListening(false);
-      setCommandStatus('Не удалось распознать голос.');
-      hapticFeedback('impact');
-    };
-    recognition.onresult = (event) => {
-      const transcript = event.results?.[0]?.[0]?.transcript || '';
-      setCommandText(transcript);
-      runAssistantCommand(transcript);
-    };
-    recognition.start();
+
+    const preferredMimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus'
+      : MediaRecorder.isTypeSupported('audio/webm')
+      ? 'audio/webm'
+      : MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')
+      ? 'audio/ogg;codecs=opus'
+      : '';
+
+    navigator.mediaDevices.getUserMedia({ audio: true })
+      .then((stream) => {
+        const recorder = preferredMimeType
+          ? new MediaRecorder(stream, { mimeType: preferredMimeType })
+          : new MediaRecorder(stream);
+        const mimeType = recorder.mimeType || preferredMimeType || 'audio/webm';
+        voiceStreamRef.current = stream;
+        voiceChunksRef.current = [];
+        mediaRecorderRef.current = recorder;
+
+        recorder.ondataavailable = (event) => {
+          if (event.data.size > 0) voiceChunksRef.current.push(event.data);
+        };
+
+        recorder.onerror = () => {
+          setCommandStatus('Не удалось записать голос.');
+          hapticFeedback('impact');
+        };
+
+        recorder.onstop = () => {
+          if (voiceTimeoutRef.current) {
+            window.clearTimeout(voiceTimeoutRef.current);
+            voiceTimeoutRef.current = null;
+          }
+          stream.getTracks().forEach((track) => track.stop());
+          voiceStreamRef.current = null;
+          setIsListening(false);
+
+          const audioBlob = new Blob(voiceChunksRef.current, { type: mimeType });
+          voiceChunksRef.current = [];
+          if (!audioBlob.size) {
+            setCommandStatus('Голос не записался. Попробуйте ещё раз.');
+            hapticFeedback('impact');
+            return;
+          }
+
+          const ext = mimeType.includes('ogg') ? 'ogg' : 'webm';
+          setIsVoiceUploading(true);
+          setCommandStatus('Распознаю голос...');
+          asrAPI.transcribe(audioBlob, `command.${ext}`)
+            .then((text) => {
+              setCommandText(text);
+              setCommandStatus(`Распознано: ${text}`);
+              return runAssistantCommand(text);
+            })
+            .catch((err) => {
+              const message = err instanceof Error ? err.message : 'Не удалось распознать голос';
+              setCommandStatus(message);
+              setError(message);
+              hapticFeedback('impact');
+            })
+            .finally(() => {
+              setIsVoiceUploading(false);
+            });
+        };
+
+        recorder.start(250);
+        setIsListening(true);
+        setCommandStatus('Запись... нажмите микрофон ещё раз, чтобы отправить.');
+        voiceTimeoutRef.current = window.setTimeout(() => {
+          if (mediaRecorderRef.current?.state === 'recording') {
+            mediaRecorderRef.current.stop();
+          }
+        }, 18000);
+        hapticFeedback('impact');
+      })
+      .catch((err) => {
+        const message = err instanceof Error ? err.message : 'Нет доступа к микрофону';
+        setCommandStatus(message);
+        setError(message);
+        hapticFeedback('impact');
+      });
   };
 
   const isSplitModeOwner = currentParticipant.id === (liveCreatorParticipantId || currentRoom.creatorId);
@@ -668,19 +756,22 @@ export const SelectItemsPage: React.FC = () => {
                 setCommandStatus(null);
               }}
               onKeyDown={(event) => {
-                if (event.key === 'Enter') runAssistantCommand();
+                if (event.key === 'Enter') void runAssistantCommand();
               }}
+              disabled={isCommandLoading || isVoiceUploading}
             />
             <Button
-              aria-label="Голосовая команда"
-              variant={isListening ? 'primary' : 'secondary'}
+              aria-label={isListening ? 'Остановить запись' : 'Голосовая команда'}
+              variant={isListening ? 'danger' : 'secondary'}
               onClick={startVoiceCommand}
+              disabled={isCommandLoading || isVoiceUploading}
+              loading={isVoiceUploading}
               style={{ minWidth: 46, paddingLeft: 0, paddingRight: 0, alignSelf: 'end' }}
             >
-              {isListening ? '...' : '🎙'}
+              {isListening ? '■' : '🎙'}
             </Button>
           </div>
-          <Button fullWidth variant="ghost" onClick={() => runAssistantCommand()} disabled={!commandText.trim()} style={{ marginTop: spacing.sm }}>
+          <Button fullWidth variant="ghost" onClick={() => void runAssistantCommand()} disabled={!commandText.trim() || isCommandLoading || isVoiceUploading || isListening} loading={isCommandLoading} style={{ marginTop: spacing.sm }}>
             Выполнить команду
           </Button>
           {commandStatus && (

@@ -40,7 +40,8 @@ class Settings(BaseSettings):
     # OPENROUTER ASR
     openrouter_api_key: str | None = None
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    asr_model: str = "mistralai/voxtral-small-24b-2507"  # OpenRouter model for audio transcription
+    asr_model: str = "mistralai/voxtral-mini-transcribe"
+    asr_fallback_models: str = "qwen/qwen3-asr-flash-2026-02-10,openai/gpt-4o-mini-transcribe,openai/whisper-large-v3"
     asr_temperature: float = 0.0
     asr_timeout: int = 30  # seconds
     
