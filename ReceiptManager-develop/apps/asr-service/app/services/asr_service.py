@@ -120,12 +120,17 @@ class ASRService:
             "Content-Type": "application/json",
         }
 
-        async with httpx.AsyncClient(timeout=settings.asr_timeout) as client:
-            response = await client.post(
-                f"{settings.openrouter_base_url.rstrip('/')}/audio/transcriptions",
-                json=payload,
-                headers=headers,
-            )
+        try:
+            async with httpx.AsyncClient(timeout=settings.asr_timeout) as client:
+                response = await client.post(
+                    f"{settings.openrouter_base_url.rstrip('/')}/audio/transcriptions",
+                    json=payload,
+                    headers=headers,
+                )
+        except httpx.TimeoutException as exc:
+            raise ASRProcessingError(f"OpenRouter request timed out after {settings.asr_timeout}s") from exc
+        except httpx.HTTPError as exc:
+            raise ASRProcessingError(f"OpenRouter request failed: {exc}") from exc
 
         if response.status_code >= 400:
             detail = self._extract_error_detail(response)
