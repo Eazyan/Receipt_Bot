@@ -20,6 +20,18 @@ const participantTotal = (items: ReceiptItem[], itemSplits: Record<string, Recor
 const participantSelectedCount = (items: ReceiptItem[], itemSplits: Record<string, Record<string, number>>, participantId: string) =>
   items.filter((item) => (itemSplits[item.id]?.[participantId] || 0) > 0).length;
 
+const buildSplitAsrPrompt = (items: ReceiptItem[], participants: SplitParticipant[]) => {
+  const itemNames = items.slice(0, 100).map((item) => item.name).join('; ');
+  const participantNames = participants.map((participant) => participant.name).join(', ');
+  return [
+    'Это русская голосовая команда для разделения чека в Telegram Mini App.',
+    'Верни только текст команды, без пояснений.',
+    'Команды похожи на: апельсины мне, кофе Маше, салат пополам, всё поровну, забери всё себе, сбрось моё.',
+    `Участники: ${participantNames}.`,
+    `Товары в чеке: ${itemNames}.`,
+  ].join(' ');
+};
+
 const buildPaymentSplits = (
   items: ReceiptItem[],
   itemSplits: Record<string, Record<string, number>>,
@@ -387,7 +399,7 @@ export const SelectItemsPage: React.FC = () => {
     hapticFeedback('success');
   };
 
-  const runAssistantCommand = async (rawCommand = commandText) => {
+  const runAssistantCommand = async (rawCommand = commandText, voiceTranscript?: string) => {
     const command = rawCommand.trim();
     if (!command) {
       setCommandStatus('Напишите команду для агента.');
@@ -400,7 +412,8 @@ export const SelectItemsPage: React.FC = () => {
       const result = await roomAPI.runAssistantCommand(currentRoom.id, currentParticipant.id, command);
       applyLiveRoomState(result.state);
       setSyncStatus('live');
-      setCommandStatus(result.message || 'Готово.');
+      const message = result.message || 'Готово.';
+      setCommandStatus(voiceTranscript ? `Распознано: ${voiceTranscript}. ${message}` : message);
       setCommandText('');
       hapticFeedback(result.actions.length > 0 ? 'success' : 'impact');
     } catch (err) {
@@ -473,11 +486,11 @@ export const SelectItemsPage: React.FC = () => {
           const ext = mimeType.includes('ogg') ? 'ogg' : 'webm';
           setIsVoiceUploading(true);
           setCommandStatus('Распознаю голос...');
-          asrAPI.transcribe(audioBlob, `command.${ext}`)
+          asrAPI.transcribe(audioBlob, `command.${ext}`, buildSplitAsrPrompt(receipt.items, splitParticipants))
             .then((text) => {
               setCommandText(text);
               setCommandStatus(`Распознано: ${text}`);
-              return runAssistantCommand(text);
+              return runAssistantCommand(text, text);
             })
             .catch((err) => {
               const message = err instanceof Error ? err.message : 'Не удалось распознать голос';

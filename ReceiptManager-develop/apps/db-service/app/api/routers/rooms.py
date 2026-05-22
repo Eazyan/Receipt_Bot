@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session, selectinload
@@ -13,6 +14,7 @@ from app.services.room_assistant import RoomAssistantError, build_room_assistant
 from app.services.room_state import apply_room_action, channel_key, get_redis, get_room_state, public_state_for_participant
 
 router = APIRouter(prefix="/rooms", tags=["rooms"])
+logger = logging.getLogger(__name__)
 
 
 @router.get("/{room_id}/state")
@@ -56,6 +58,15 @@ async def run_room_assistant(room_id: int, payload: dict, db: Session = Depends(
         if "Participant is not in this room" in detail:
             raise HTTPException(status_code=403, detail=detail) from exc
         raise HTTPException(status_code=502, detail=detail) from exc
+
+    logger.info(
+        "Room assistant command room_id=%s participant_id=%s command=%r actions=%s message=%r",
+        room_id,
+        participant_id,
+        command,
+        plan["actions"],
+        plan["message"],
+    )
 
     next_state = public_state_for_participant(state, participant_id)
     for action in plan["actions"]:

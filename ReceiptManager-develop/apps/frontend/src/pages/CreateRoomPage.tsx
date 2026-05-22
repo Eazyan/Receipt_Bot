@@ -15,7 +15,7 @@ import {
 } from '@/components/UI';
 import { ReceiptItemList, ReceiptSummary, getReceiptSubtotal } from '@/components/ReceiptItems';
 import { useAppStore } from '@/hooks/useAppStore';
-import { receiptAPI, roomAPI } from '@/utils/api';
+import { asrAPI, receiptAPI, roomAPI } from '@/utils/api';
 import { hapticFeedback, shareText, showTelegramAlert } from '@/utils/telegram';
 import type { Receipt, ReceiptItem } from '@/types';
 
@@ -39,6 +39,19 @@ const isSuspiciousName = (name: string) => {
   return lower.includes('жайка') || lower.includes('???') || lower.length < 4;
 };
 
+const buildReceiptEditAsrPrompt = (receipt: Receipt) => {
+  const items = receipt.items
+    .slice(0, 80)
+    .map((item) => `${item.name} ${rub(item.price)} x ${item.quantity}`)
+    .join('; ');
+  return [
+    'Это русская голосовая команда для редактирования распознанного чека.',
+    'Верни только текст команды, без пояснений.',
+    'Команды похожи на: удали пакет, апельсины должны быть 120 рублей, переименуй салат в цезарь, добавь кофе 2 штуки по 150, исправь количество кефира на 2.',
+    `Текущие строки чека: ${items}.`,
+  ].join(' ');
+};
+
 export const CreateRoomPage: React.FC = () => {
   const { setCurrentPage, setCurrentRoom, setCurrentParticipant, applyLiveRoomState, telegramUser } = useAppStore();
   const [step, setStep] = useState<CreateRoomStep>('upload');
@@ -51,6 +64,11 @@ export const CreateRoomPage: React.FC = () => {
   const [newItemName, setNewItemName] = useState('');
   const [newItemPrice, setNewItemPrice] = useState('');
   const [newItemQty, setNewItemQty] = useState('1');
+  const [assistantText, setAssistantText] = useState('');
+  const [assistantStatus, setAssistantStatus] = useState<string | null>(null);
+  const [isAssistantLoading, setIsAssistantLoading] = useState(false);
+  const [isAssistantListening, setIsAssistantListening] = useState(false);
+  const [isAssistantVoiceUploading, setIsAssistantVoiceUploading] = useState(false);
   const [editingItem, setEditingItem] = useState<ReceiptItem | null>(null);
   const [editItemName, setEditItemName] = useState('');
   const [editItemPrice, setEditItemPrice] = useState('');
@@ -62,6 +80,10 @@ export const CreateRoomPage: React.FC = () => {
   });
   const fileInputRef = useRef<HTMLInputElement>(null);
   const toastTimerRef = useRef<number | null>(null);
+  const assistantRecorderRef = useRef<MediaRecorder | null>(null);
+  const assistantChunksRef = useRef<Blob[]>([]);
+  const assistantStreamRef = useRef<MediaStream | null>(null);
+  const assistantVoiceTimeoutRef = useRef<number | null>(null);
 
   const receiptSubtotal = receipt ? getReceiptSubtotal(receipt.items) : 0;
   const totalDelta = receipt ? Math.abs(receipt.totalSum - receiptSubtotal) : 0;
@@ -74,10 +96,21 @@ export const CreateRoomPage: React.FC = () => {
     if (receiptPreviewUrl) {
       URL.revokeObjectURL(receiptPreviewUrl);
     }
+  }, [receiptPreviewUrl]);
+
+  useEffect(() => () => {
     if (toastTimerRef.current) {
       window.clearTimeout(toastTimerRef.current);
     }
-  }, [receiptPreviewUrl]);
+    if (assistantVoiceTimeoutRef.current) {
+      window.clearTimeout(assistantVoiceTimeoutRef.current);
+      assistantVoiceTimeoutRef.current = null;
+    }
+    if (assistantRecorderRef.current?.state === 'recording') {
+      assistantRecorderRef.current.stop();
+    }
+    assistantStreamRef.current?.getTracks().forEach((track) => track.stop());
+  }, []);
 
   const flashToast = (message: string, action?: { label: string; onAction: () => void }, duration = 2400) => {
     if (toastTimerRef.current) {
@@ -148,6 +181,135 @@ export const CreateRoomPage: React.FC = () => {
     } finally {
       setIsLoading(false);
     }
+  };
+
+  const runReceiptAssistantCommand = async (rawCommand = assistantText, voiceTranscript?: string) => {
+    const command = rawCommand.trim();
+    if (!receipt || !command) {
+      setAssistantStatus('Напишите, что исправить в чеке.');
+      hapticFeedback('impact');
+      return;
+    }
+
+    setIsAssistantLoading(true);
+    setAssistantStatus('Думаю...');
+    setError(null);
+
+    try {
+      const result = await receiptAPI.runAssistantCommand(receipt.id, command);
+      setReceipt(result.receipt);
+      setAssistantText('');
+      const message = result.message || 'Готово.';
+      setAssistantStatus(voiceTranscript ? `Распознано: ${voiceTranscript}. ${message}` : message);
+      hapticFeedback(result.actions.length > 0 ? 'success' : 'impact');
+      if (result.actions.length > 0) {
+        flashToast(message);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Агент не смог исправить чек';
+      setAssistantStatus(message);
+      setError(message);
+      hapticFeedback('impact');
+    } finally {
+      setIsAssistantLoading(false);
+    }
+  };
+
+  const startReceiptVoiceCommand = () => {
+    if (!receipt) return;
+    const currentReceipt = receipt;
+    if (isAssistantListening) {
+      if (assistantRecorderRef.current?.state === 'recording') {
+        assistantRecorderRef.current.stop();
+      }
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+      setAssistantStatus('Голосовой ввод недоступен в этом WebView. Используйте текст.');
+      hapticFeedback('impact');
+      return;
+    }
+
+    const preferredMimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+      ? 'audio/webm;codecs=opus'
+      : MediaRecorder.isTypeSupported('audio/webm')
+      ? 'audio/webm'
+      : MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')
+      ? 'audio/ogg;codecs=opus'
+      : '';
+
+    navigator.mediaDevices.getUserMedia({ audio: true })
+      .then((stream) => {
+        const recorder = preferredMimeType
+          ? new MediaRecorder(stream, { mimeType: preferredMimeType })
+          : new MediaRecorder(stream);
+        const mimeType = recorder.mimeType || preferredMimeType || 'audio/webm';
+        assistantStreamRef.current = stream;
+        assistantChunksRef.current = [];
+        assistantRecorderRef.current = recorder;
+
+        recorder.ondataavailable = (event) => {
+          if (event.data.size > 0) assistantChunksRef.current.push(event.data);
+        };
+
+        recorder.onerror = () => {
+          setAssistantStatus('Не удалось записать голос.');
+          hapticFeedback('impact');
+        };
+
+        recorder.onstop = () => {
+          if (assistantVoiceTimeoutRef.current) {
+            window.clearTimeout(assistantVoiceTimeoutRef.current);
+            assistantVoiceTimeoutRef.current = null;
+          }
+          stream.getTracks().forEach((track) => track.stop());
+          assistantStreamRef.current = null;
+          setIsAssistantListening(false);
+
+          const audioBlob = new Blob(assistantChunksRef.current, { type: mimeType });
+          assistantChunksRef.current = [];
+          if (!audioBlob.size) {
+            setAssistantStatus('Голос не записался. Попробуйте ещё раз.');
+            hapticFeedback('impact');
+            return;
+          }
+
+          const ext = mimeType.includes('ogg') ? 'ogg' : 'webm';
+          setIsAssistantVoiceUploading(true);
+          setAssistantStatus('Распознаю голос...');
+          asrAPI.transcribe(audioBlob, `receipt-edit.${ext}`, buildReceiptEditAsrPrompt(currentReceipt))
+            .then((text) => {
+              setAssistantText(text);
+              setAssistantStatus(`Распознано: ${text}`);
+              return runReceiptAssistantCommand(text, text);
+            })
+            .catch((err) => {
+              const message = err instanceof Error ? err.message : 'Не удалось распознать голос';
+              setAssistantStatus(message);
+              setError(message);
+              hapticFeedback('impact');
+            })
+            .finally(() => {
+              setIsAssistantVoiceUploading(false);
+            });
+        };
+
+        recorder.start(250);
+        setIsAssistantListening(true);
+        setAssistantStatus('Запись... нажмите микрофон ещё раз, чтобы отправить.');
+        assistantVoiceTimeoutRef.current = window.setTimeout(() => {
+          if (assistantRecorderRef.current?.state === 'recording') {
+            assistantRecorderRef.current.stop();
+          }
+        }, 18000);
+        hapticFeedback('impact');
+      })
+      .catch((err) => {
+        const message = err instanceof Error ? err.message : 'Нет доступа к микрофону';
+        setAssistantStatus(message);
+        setError(message);
+        hapticFeedback('impact');
+      });
   };
 
   const handleDeleteItem = async (itemId: string) => {
@@ -472,6 +634,55 @@ export const CreateRoomPage: React.FC = () => {
           </Card>
 
           <ReceiptSummary items={receipt.items} tip={receipt.tip} service={receipt.service} expectedTotal={receipt.totalSum} />
+
+          <Card>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: spacing.md, alignItems: 'center', marginBottom: spacing.sm }}>
+              <div style={{ ...typography.subtitle }}>AI-правка чека</div>
+              <Pill tone={isAssistantLoading || isAssistantVoiceUploading ? 'yellow' : 'blue'}>
+                {isAssistantListening ? 'запись' : isAssistantVoiceUploading ? 'ASR' : 'агент'}
+              </Pill>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 46px', gap: spacing.sm }}>
+              <Input
+                aria-label="Команда редактирования чека"
+                placeholder="Например: удали пакет, апельсины 99 рублей"
+                value={assistantText}
+                onChange={(event) => {
+                  setAssistantText(event.target.value);
+                  setAssistantStatus(null);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') void runReceiptAssistantCommand();
+                }}
+                disabled={isAssistantLoading || isAssistantVoiceUploading}
+              />
+              <Button
+                aria-label={isAssistantListening ? 'Остановить запись' : 'Голосовая правка чека'}
+                variant={isAssistantListening ? 'danger' : 'secondary'}
+                onClick={startReceiptVoiceCommand}
+                disabled={isAssistantLoading || isAssistantVoiceUploading}
+                loading={isAssistantVoiceUploading}
+                style={{ minWidth: 46, paddingLeft: 0, paddingRight: 0, alignSelf: 'end' }}
+              >
+                {isAssistantListening ? '■' : '🎙'}
+              </Button>
+            </div>
+            <Button
+              fullWidth
+              variant="ghost"
+              onClick={() => void runReceiptAssistantCommand()}
+              disabled={!assistantText.trim() || isAssistantLoading || isAssistantVoiceUploading || isAssistantListening}
+              loading={isAssistantLoading}
+              style={{ marginTop: spacing.sm }}
+            >
+              Исправить чек
+            </Button>
+            {assistantStatus && (
+              <div style={{ ...typography.caption, color: colors.textSecondary, marginTop: spacing.sm }}>
+                {assistantStatus}
+              </div>
+            )}
+          </Card>
 
           {receiptPreviewUrl && (
             <Card

@@ -190,9 +190,12 @@ export const roomAPI = {
 };
 
 export const asrAPI = {
-  transcribe: async (audio: Blob, filename = 'voice.webm'): Promise<string> => {
+  transcribe: async (audio: Blob, filename = 'voice.webm', prompt?: string): Promise<string> => {
     const formData = new FormData();
     formData.append('file', audio, filename);
+    if (prompt?.trim()) {
+      formData.append('prompt', prompt.trim());
+    }
 
     const response = await fetch(ASR_URL, {
       method: 'POST',
@@ -246,6 +249,18 @@ export const receiptAPI = {
   removeItem: async (receiptId: string, itemId: string): Promise<Receipt> => {
     const { data } = await api.delete(`/receipts/${receiptId}/items/${itemId}`);
     return toReceipt(data);
+  },
+
+  runAssistantCommand: async (
+    receiptId: string,
+    command: string,
+  ): Promise<{ message: string; actions: Record<string, unknown>[]; receipt: Receipt }> => {
+    const { data } = await api.post(`/receipts/${receiptId}/assistant`, { command });
+    return {
+      message: data.message,
+      actions: data.actions ?? [],
+      receipt: toReceipt(data.receipt),
+    };
   },
 
   updateTipAndService: async (receiptId: string, tip: number, service: number): Promise<Receipt> => {

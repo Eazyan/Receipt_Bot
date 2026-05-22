@@ -29,7 +29,7 @@ async def health_check() -> HealthResponse:
 @router.post("/transcribe", response_model=TranscriptionResponse)
 async def transcribe_audio(
     file: UploadFile = File(...),
-    prompt: str = "Transcribe the audio to text. Respond ONLY in the language of the audio with the transcribed text and nothing else.",
+    prompt: str | None = None,
 ) -> TranscriptionResponse:
     """
     Transcribe audio file to text using OpenRouter ASR model

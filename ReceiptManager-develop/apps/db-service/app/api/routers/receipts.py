@@ -1,5 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
+import logging
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
@@ -7,8 +8,10 @@ from app.db.database import get_db
 from app.db.models import Receipt, ReceiptItem, User
 from app.api.schemas import ReceiptCreate, ReceiptItemCreate, ReceiptItemOut, ReceiptItemUpdate, ReceiptOut, ReceiptUpdate, ReceiptItemsResponse
 from app.services.openrouter_ocr import OCRServiceError, item_price, item_quantity, parse_receipt_image
+from app.services.receipt_assistant import ReceiptAssistantError, build_receipt_assistant_plan
 
 router = APIRouter(prefix="/receipts", tags=["receipts"])
+logger = logging.getLogger(__name__)
 
 
 def _get_or_create_demo_user(db: Session) -> User:
@@ -66,6 +69,67 @@ def _receipt_payload(receipt: Receipt) -> dict:
         "totalSum": float(total_sum),
         "items": items,
     }
+
+
+def _apply_receipt_assistant_action(receipt: Receipt, action: dict, db: Session) -> None:
+    action_type = action.get("type")
+
+    if action_type == "update_item":
+        item = db.get(ReceiptItem, int(action["itemId"]))
+        if not item or item.receipt_id != receipt.id:
+            return
+        if "name" in action:
+            item.name = str(action["name"])[:255]
+        if "price" in action:
+            item.price = Decimal(str(action["price"]))
+        if "quantity" in action:
+            item.quantity = Decimal(str(action["quantity"]))
+
+    elif action_type == "add_item":
+        db.add(ReceiptItem(
+            receipt_id=receipt.id,
+            name=str(action["name"])[:255],
+            price=Decimal(str(action["price"])),
+            quantity=Decimal(str(action.get("quantity", 1))),
+        ))
+
+    elif action_type == "delete_item":
+        item = db.get(ReceiptItem, int(action["itemId"]))
+        if item and item.receipt_id == receipt.id:
+            db.delete(item)
+
+    elif action_type == "merge_items":
+        item_ids = [int(item_id) for item_id in action.get("itemIds", [])]
+        items = [
+            item for item_id in item_ids
+            if (item := db.get(ReceiptItem, item_id)) and item.receipt_id == receipt.id
+        ]
+        if len(items) < 2:
+            return
+        total = sum((item.price * item.quantity for item in items), Decimal("0"))
+        keeper = items[0]
+        keeper.name = str(action.get("name") or keeper.name)[:255]
+        keeper.price = total.quantize(Decimal("0.01"))
+        keeper.quantity = Decimal("1")
+        for item in items[1:]:
+            db.delete(item)
+
+    elif action_type == "split_item":
+        item = db.get(ReceiptItem, int(action["itemId"]))
+        split_items = action.get("items", [])
+        if not item or item.receipt_id != receipt.id or not split_items:
+            return
+        first = split_items[0]
+        item.name = str(first["name"])[:255]
+        item.price = Decimal(str(first["price"]))
+        item.quantity = Decimal(str(first.get("quantity", 1)))
+        for next_item in split_items[1:]:
+            db.add(ReceiptItem(
+                receipt_id=receipt.id,
+                name=str(next_item["name"])[:255],
+                price=Decimal(str(next_item["price"])),
+                quantity=Decimal(str(next_item.get("quantity", 1))),
+            ))
 
 
 @router.post("/", response_model=ReceiptOut, status_code=201)
@@ -129,6 +193,42 @@ def get_receipt(receipt_id: int, db: Session = Depends(get_db)):
     if not receipt:
         raise HTTPException(status_code=404, detail="Receipt not found")
     return receipt
+
+
+@router.post("/{receipt_id}/assistant")
+def run_receipt_assistant(receipt_id: int, payload: dict, db: Session = Depends(get_db)):
+    command = str(payload.get("command") or "").strip()
+    if not command:
+        raise HTTPException(status_code=400, detail="Command is required")
+
+    receipt = db.get(Receipt, receipt_id)
+    if not receipt:
+        raise HTTPException(status_code=404, detail="Receipt not found")
+
+    before_payload = _receipt_payload(receipt)
+    try:
+        plan = build_receipt_assistant_plan(before_payload, command)
+    except ReceiptAssistantError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    logger.info(
+        "Receipt assistant command receipt_id=%s command=%r actions=%s message=%r",
+        receipt_id,
+        command,
+        plan["actions"],
+        plan["message"],
+    )
+
+    for action in plan["actions"]:
+        _apply_receipt_assistant_action(receipt, action, db)
+
+    db.commit()
+    db.refresh(receipt)
+    return {
+        "message": plan["message"],
+        "actions": plan["actions"],
+        "receipt": _receipt_payload(receipt),
+    }
 
 
 @router.patch("/{receipt_id}", response_model=ReceiptOut)

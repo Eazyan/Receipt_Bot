@@ -42,6 +42,13 @@ class Settings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     asr_model: str = "openai/gpt-4o-transcribe"
     asr_fallback_models: str = "google/chirp-3,openai/gpt-4o-mini-transcribe,mistralai/voxtral-mini-transcribe,openai/whisper-large-v3"
+    asr_language: str = "ru"
+    asr_prompt: str = (
+        "Это голосовая команда для Telegram Mini App разделения чека. "
+        "Распознавай названия продуктов и имена участников на русском. "
+        "Примеры команд: апельсины мне, кофе Маше, салат пополам, всё поровну. "
+        "Верни только текст команды."
+    )
     asr_temperature: float = 0.0
     asr_timeout: int = 15  # seconds per model before trying the next fallback
     

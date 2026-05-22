@@ -48,12 +48,13 @@ class ASRService:
             response_data, used_model = await self._transcribe_with_fallbacks(
                 audio_base64=audio_base64,
                 audio_format=audio_format,
+                user_prompt=user_prompt,
             )
 
             transcribed_text = str(response_data.get("text") or "").strip()
 
-            if not transcribed_text:
-                raise ASRProcessingError("Model returned empty text")
+            if not self._is_usable_transcription(transcribed_text):
+                raise ASRProcessingError(f"Model returned unusable transcription: {transcribed_text!r}")
 
             logger.info(f"Transcription successful: {transcribed_text[:100]}...")
 
@@ -84,6 +85,7 @@ class ASRService:
         self,
         audio_base64: str,
         audio_format: str,
+        user_prompt: str | None,
     ) -> tuple[dict[str, Any], str]:
         errors: list[str] = []
         for model in self.models:
@@ -92,6 +94,7 @@ class ASRService:
                     model=model,
                     audio_base64=audio_base64,
                     audio_format=audio_format,
+                    user_prompt=user_prompt,
                 )
                 return response_data, model
             except ASRProcessingError as exc:
@@ -105,6 +108,7 @@ class ASRService:
         model: str,
         audio_base64: str,
         audio_format: str,
+        user_prompt: str | None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": model,
@@ -114,6 +118,11 @@ class ASRService:
             },
             "temperature": settings.asr_temperature,
         }
+        if settings.asr_language:
+            payload["language"] = settings.asr_language
+        prompt = " ".join((user_prompt or settings.asr_prompt or "").split()).strip()
+        if prompt:
+            payload["prompt"] = prompt[:1800]
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -141,10 +150,26 @@ class ASRService:
         except ValueError as exc:
             raise ASRProcessingError("OpenRouter returned non-JSON response") from exc
 
-        if not str(data.get("text") or "").strip():
-            raise ASRProcessingError("OpenRouter returned empty transcription")
+        text = str(data.get("text") or "").strip()
+        if not self._is_usable_transcription(text):
+            raise ASRProcessingError(f"OpenRouter returned unusable transcription: {text!r}")
 
         return data
+
+    def _is_usable_transcription(self, text: str) -> bool:
+        cleaned = " ".join(text.split()).strip(" .,!?:;\"'«»")
+        if len(cleaned) < 2:
+            return False
+        lowered = cleaned.lower()
+        bad_phrases = {
+            "you",
+            "thanks",
+            "thank you",
+            "subtitles",
+            "music",
+            "silence",
+        }
+        return lowered not in bad_phrases
 
     def _extract_error_detail(self, response: httpx.Response) -> str:
         try:

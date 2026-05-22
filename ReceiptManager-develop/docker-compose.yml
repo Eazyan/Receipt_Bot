@@ -112,10 +112,12 @@ services:
     ports:
       - ${ASR_SERVICE_HOST_PORT:-15030}:5030
     environment:
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-      - ASR_MODEL=${ASR_MODEL:-openai/gpt-4o-transcribe}
-      - ASR_FALLBACK_MODELS=${ASR_FALLBACK_MODELS:-google/chirp-3,openai/gpt-4o-mini-transcribe,mistralai/voxtral-mini-transcribe,openai/whisper-large-v3}
-      - ASR_TIMEOUT=${ASR_TIMEOUT:-15}
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY}"
+      ASR_MODEL: "${ASR_MODEL:-openai/gpt-4o-transcribe}"
+      ASR_FALLBACK_MODELS: "${ASR_FALLBACK_MODELS:-google/chirp-3,openai/gpt-4o-mini-transcribe,mistralai/voxtral-mini-transcribe,openai/whisper-large-v3}"
+      ASR_LANGUAGE: "${ASR_LANGUAGE:-ru}"
+      ASR_PROMPT: "${ASR_PROMPT:-Это голосовая команда для Telegram Mini App разделения чека. Распознавай названия продуктов и имена участников на русском. Примеры команд: апельсины мне, кофе Маше, салат пополам, всё поровну. Верни только текст команды.}"
+      ASR_TIMEOUT: "${ASR_TIMEOUT:-15}"
     healthcheck:
       test: [ "CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5030/health', timeout=5)\"" ]
       interval: 10s
